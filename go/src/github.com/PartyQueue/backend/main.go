@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/samsarahq/thunder/graphql"
@@ -26,11 +25,11 @@ type Room struct {
 
 type Request struct {
 	Uri      string `sql:",primary"`
-	Priority int
+	Priority int    `graphql:"-"`
 	Time     time.Time
-	RoomId   string   `sql:",primary"`
-	Metadata Metadata `sql:"-"`
+	RoomId   string `sql:",primary"`
 }
+
 type Metadata struct {
 	Uri        string `sql:",primary"`
 	Title      string
@@ -53,22 +52,7 @@ type Server struct {
 // registerQuery registers the root query resolvers.
 func (s *Server) registerQuery(schema *schemabuilder.Schema) {
 	query := schema.Query()
-	// posts returns all posts in the database.
-	query.FieldFunc("rooms", func(ctx context.Context) ([]*Room, error) {
-		var rooms []*Room
-		if err := s.db.Query(ctx, &rooms, nil, nil); err != nil {
-			return nil, err
-		}
-		return rooms, nil
-	})
 
-	query.FieldFunc("requests", func(ctx context.Context) ([]*Request, error) {
-		var requests []*Request
-		if err := s.db.Query(ctx, &requests, nil, nil); err != nil {
-			return nil, err
-		}
-		return requests, nil
-	})
 	query.FieldFunc("room", func(ctx context.Context, args roomIdArgs) (*Room, error) {
 		var room *Room
 		filter := sqlgen.Filter{}
@@ -83,53 +67,11 @@ func (s *Server) registerQuery(schema *schemabuilder.Schema) {
 	})
 }
 
-func buildSqlgenSchema() *sqlgen.Schema {
-	schema := sqlgen.NewSchema()
-	schema.MustRegisterType("rooms", sqlgen.UniqueId, Room{})
-	schema.MustRegisterType("requests", sqlgen.UniqueId, Request{})
-	schema.MustRegisterType("songs", sqlgen.UniqueId, Metadata{})
-	return schema
-}
-
-var SqlgenSchema = buildSqlgenSchema()
-
-// schema builds the graphql schema.
-func (s *Server) schema() *graphql.Schema {
-	builder := schemabuilder.NewSchema()
-	s.registerQuery(builder)
-	s.registerMutation(builder)
-	s.registerRoom(builder)
-	return builder.MustBuild()
-}
-
-type DatabaseConfig struct {
-	Username     string
-	Password     string
-	Hostname     string
-	DatabaseName string
-	Port         string
-}
-
-// SQLMultiValue creates a multi value interpolation statement:
-// in: 3 out: (?,?,?)
-// in: 6 out: (?,?,?,?,?,?)
-func SQLMultiValue(valueCount int) string {
-	var builder strings.Builder
-	_ = builder.WriteByte('(')
-	for i := 0; i < valueCount; i++ {
-		if i != 0 {
-			_ = builder.WriteByte(',')
-		}
-		_ = builder.WriteByte('?')
-	}
-	builder.WriteByte(')')
-	return builder.String()
-}
-
 // registerMutation registers the root mutation type.
 func (s *Server) registerMutation(schema *schemabuilder.Schema) {
 	object := schema.Mutation()
 
+	// temporary
 	object.FieldFunc("echo", func(ctx context.Context, args struct{ Text string }) (string, error) {
 		return args.Text, nil
 	})
@@ -138,38 +80,55 @@ func (s *Server) registerMutation(schema *schemabuilder.Schema) {
 
 func (s *Server) registerRoom(schema *schemabuilder.Schema) {
 	obj := schema.Object("Room", Room{})
+
+	obj.FieldFunc("nowPlaying", func(ctx context.Context, p *Room) (*Request, error) {
+		var request *Request
+		if err := s.db.QueryRow(ctx, &request, sqlgen.Filter{"room_id": p.Id}, &sqlgen.SelectOptions{OrderBy: "priority,time", Limit: 1, Where: "priority < 0"}); err != nil {
+			return nil, nil
+		}
+		return request, nil
+	})
+
 	obj.FieldFunc("requests", func(ctx context.Context, p *Room) ([]*Request, error) {
 		var requests []*Request
-		if err := s.db.Query(ctx, &requests, sqlgen.Filter{"room_id": p.Id}, &sqlgen.SelectOptions{OrderBy: "priority,time"}); err != nil {
+		if err := s.db.Query(ctx, &requests, sqlgen.Filter{"room_id": p.Id}, &sqlgen.SelectOptions{OrderBy: "priority,time", Where: "priority >= 0"}); err != nil {
 			return nil, nil
-		}
-		var songs []*Metadata
-
-		valuesLen := len(requests)
-		if valuesLen == 0 {
-			return nil, nil
-		}
-		// hacky join
-		whereStr := fmt.Sprintf("uri IN %s", SQLMultiValue(valuesLen))
-		valuesSlice := make([]interface{}, valuesLen)
-		for i := range requests {
-			valuesSlice[i] = requests[i].Uri
-		}
-		if err := s.db.Query(ctx, &songs, nil, &sqlgen.SelectOptions{Where: whereStr, Values: valuesSlice}); err != nil {
-			return nil, nil
-		}
-		m := make(map[string]*Metadata)
-		for _, song := range songs {
-			m[song.Uri] = song
-		}
-		for _, element := range requests {
-			element.Metadata = *m[element.Uri]
 		}
 		return requests, nil
 	})
 }
 
+func (s *Server) registerRequest(schema *schemabuilder.Schema) {
+	obj := schema.Object("Request", Request{})
+	obj.FieldFunc("metadata", func(ctx context.Context, r *Request) (*Metadata, error) {
+		var metadata *Metadata
+		if err := s.db.QueryRow(ctx, &metadata, sqlgen.Filter{"uri": r.Uri}, nil); err != nil {
+			return nil, nil
+		}
+		return metadata, nil
+	})
+}
+
+func buildSqlgenSchema() *sqlgen.Schema {
+	schema := sqlgen.NewSchema()
+	schema.MustRegisterType("rooms", sqlgen.UniqueId, Room{})
+	schema.MustRegisterType("requests", sqlgen.UniqueId, Request{})
+	schema.MustRegisterType("songs", sqlgen.UniqueId, Metadata{})
+	return schema
+}
+
+// schema builds the graphql schema.
+func (s *Server) schema() *graphql.Schema {
+	builder := schemabuilder.NewSchema()
+	s.registerQuery(builder)
+	s.registerMutation(builder)
+	s.registerRoom(builder)
+	s.registerRequest(builder)
+	return builder.MustBuild()
+}
+
 func main() {
+	SqlgenSchema := buildSqlgenSchema()
 
 	db, err := livesql.Open("localhost", 3307, "root", "dev", "party_queue", SqlgenSchema)
 	if err != nil {
