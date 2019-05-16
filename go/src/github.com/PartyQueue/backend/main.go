@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"net/http"
 	"time"
 
@@ -17,10 +18,14 @@ import (
 
 // A Post holds a row from the MySQL posts table.
 type Room struct {
-	Id        string `sql:",primary"`
-	HostToken string `graphql:"-"`
-	Created   time.Time
-	LastUsed  time.Time
+	Id              string `sql:",primary"`
+	HostToken       string `graphql:"-"`
+	Created         time.Time
+	LastUsed        time.Time
+	StartedAt       time.Time     `graphql:"-"`
+	PausedAt        time.Time     `graphql:"-"`
+	CurrentDuration time.Duration `graphql:"-"`
+	IsPaused        bool          `sql:"-"`
 }
 
 type Request struct {
@@ -63,6 +68,7 @@ func (s *Server) registerQuery(schema *schemabuilder.Schema) {
 			}
 			return nil, err
 		}
+		room.IsPaused = room.PausedAt != time.Time{}
 		return room, nil
 	})
 }
@@ -82,11 +88,11 @@ func (s *Server) registerRoom(schema *schemabuilder.Schema) {
 	obj := schema.Object("Room", Room{})
 
 	obj.FieldFunc("nowPlaying", func(ctx context.Context, p *Room) (*Request, error) {
-		var request *Request
-		if err := s.db.QueryRow(ctx, &request, sqlgen.Filter{"room_id": p.Id}, &sqlgen.SelectOptions{OrderBy: "priority,time", Limit: 1, Where: "priority < 0"}); err != nil {
+		var nowPlaying *Request
+		if err := s.db.QueryRow(ctx, &nowPlaying, sqlgen.Filter{"room_id": p.Id}, &sqlgen.SelectOptions{OrderBy: "priority,time", Limit: 1, Where: "priority < 0"}); err != nil {
 			return nil, nil
 		}
-		return request, nil
+		return nowPlaying, nil
 	})
 
 	obj.FieldFunc("requests", func(ctx context.Context, p *Room) ([]*Request, error) {
@@ -95,6 +101,17 @@ func (s *Server) registerRoom(schema *schemabuilder.Schema) {
 			return nil, nil
 		}
 		return requests, nil
+	})
+
+	obj.FieldFunc("remainingMs", func(ctx context.Context, r *Room) (*float64, error) {
+		var remaining float64
+		if r.IsPaused {
+			remaining = r.CurrentDuration.Seconds()
+		} else {
+			remaining = time.Until(r.StartedAt.Add(r.CurrentDuration)).Seconds()
+		}
+		remaining = math.Max(remaining, 0) * 1000
+		return &remaining, nil
 	})
 }
 
